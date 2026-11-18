@@ -1,0 +1,14 @@
+.venv/
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+data_cache/
+models/
+state/
+state_archive_*/
+reports/
+demo/
+replay/
+state_alpaca_*/
+STOP

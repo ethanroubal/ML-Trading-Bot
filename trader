@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Launcher:  ./trader <command>   (same as: .venv/bin/python -m daytrader <command>)
+DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ ! -x "$DIR/.venv/bin/python" ]; then
+  echo "Not set up yet. Run this once first:  bash setup.sh"
+  exit 1
+fi
+cd "$DIR" && exec "$DIR/.venv/bin/python" -m daytrader "$@"

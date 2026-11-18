@@ -1,0 +1,83 @@
+# ML Day Trader settings. Every value below is the built-in default, so you can
+# delete anything you don't want to change. Times are US/Eastern.
+
+data:
+  provider: auto          # auto | alpaca | yahoo   (auto = alpaca when keys are in .env, else yahoo)
+  interval_min: 5         # bar size in minutes
+  history_days: 0         # calendar days of history to train on; 0 = most the source allows
+                          #   (yahoo: ~58 days, alpaca: 180 days by default, up to 400)
+  alpaca_feed: iex        # iex = free real-time feed | sip = paid full-market feed
+  universe: auto          # auto | core (~70 names) | liquid (~200 names) | [AAPL, MSFT, ...] | tickers.txt
+  request_pause: 0.3      # seconds between Yahoo request batches (raise if you get rate-limited)
+  yahoo_chunk: 20         # tickers per Yahoo batch
+
+model:
+  horizon_bars: 12        # what the model predicts: the move over the next 12 bars (60 minutes)
+  min_bars_left: 4        # no entries with fewer bars than this left in the session
+  target: relative        # relative = move versus the rest of the universe | raw = outright move
+  sample_every: 2         # train on every Nth bar (neighbouring bars are nearly duplicates)
+  max_train_rows: 1500000
+  n_folds: 5              # walk-forward validation blocks
+  min_train_days: 0       # 0 = auto
+  warmup_days: 5
+  max_iter: 300           # upper bound on boosting rounds (the real count is picked out-of-sample)
+  learning_rate: 0.05
+  max_leaf_nodes: 15
+  min_samples_leaf: 200
+  l2: 1.0
+  max_features: 0.6
+  max_bins: 63
+  seeds: 3                # models averaged in the final ensemble
+  edge_haircut: 0.75      # predicted edges are multiplied by this (live edges decay vs. validation)
+  tail_calibration: true  # let the strongest signals carry bigger edges when validation backs it up
+  retrain_every_days: 1   # retrain after this many new sessions
+
+strategy:
+  capital: 100000         # fake money for a NEW paper account (also: --capital on the command line)
+  allow_short: true       # false = long-only
+  max_positions: 10
+  max_position_pct: 0.15  # largest single position, as a fraction of equity
+  max_gross_exposure: 1.0 # total long + short, as a multiple of equity (2.0 = 2x leverage)
+  max_net_exposure: 0.3   # beta-weighted long minus short: how much market direction the book may carry
+  risk_per_trade_pct: 0.005  # equity lost if a position hits its stop
+  stop_sigma: 2.5         # stop distance, in units of the stock's expected 60-minute volatility
+  target_sigma: 0.0       # profit target in the same units; 0 = exit when the model's view fades
+  min_edge_bps: 1.0       # only trade when predicted move minus round-trip cost exceeds this (1 bp = 0.01%)
+  exit_edge_bps: 0.0      # exit when the predicted move for our side falls below this
+  min_hold_bars: 2
+  max_hold_bars: 0        # 0 = auto (three times the prediction horizon)
+  cooldown_bars: 6        # after a stop-out, leave that symbol alone this long
+  max_daily_loss_pct: 0.03  # lose this much in a day -> flatten everything, stop until tomorrow
+  entry_start: "09:40"
+  entry_end: "15:30"
+  flatten_time: "15:55"   # nothing is ever held overnight
+  min_price: 5.0
+  top_n: 5                # recommendations shown per side
+
+costs:                    # what a simulated fill costs when no live bid/ask is available
+  min_half_spread_bps: 0.75
+  tick_half_spread: 0.005 # half of a one-cent spread, in dollars
+  slippage_bps: 0.75      # extra slippage per side
+  commission_per_share: 0.0
+  max_quote_spread_bps: 30.0  # live quotes wider than this are treated as unreliable
+
+broker:                   # where autonomous trades go (see "Connecting an Alpaca account" in the README)
+  mode: sim               # sim = built-in simulator | alpaca-paper | alpaca-live   (or pass --broker on the command line)
+  allow_live: false       # must be changed to true by hand before alpaca-live will start
+  order_type: limit       # limit = marketable limit orders (recommended) | market
+  limit_offset_bps: 5.0   # how far past the quote a limit order may reach
+  fill_timeout_seconds: 20  # entries not filled by then are cancelled
+  max_order_notional: 25000 # hard dollar cap on any single order
+  resting_stops: true     # keep a stop order at Alpaca for every open position
+  allow_shared_account: false  # true = start even if the account holds positions this program did not open
+
+engine:
+  poll_seconds: 30        # how often open positions are checked between bars
+  bar_delay_seconds: 6    # wait this long after a bar closes before fetching it
+  max_bar_wait_seconds: 45
+  feature_window_days: 32
+  dashboard: true         # write reports/dashboard.html while running
+
+calendar:
+  extra_holidays: []      # unscheduled market closures, e.g. ["2026-12-31"]
+  extra_early_closes: []  # unscheduled 1pm closes
