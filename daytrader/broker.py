@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from .config import Config
-from .costs import one_way_cost_bps
+from .costs import minute_of, one_way_cost_bps
 
 TRADE_FIELDS = ["date", "symbol", "side", "shares", "entry_time", "entry_price", "exit_time",
                 "exit_price", "pnl", "ret_bps", "bars_held", "reason", "predicted_bps"]
@@ -104,14 +104,18 @@ class PaperBroker:
                 pos.last_price = float(px)
 
     # ---- fills -----------------------------------------------------------
-    def _fill_price(self, is_buy: bool, ref: float, bid: Optional[float], ask: Optional[float]) -> float:
+    quote_spreads = True     # fill at the live bid/ask when one is given (off when quotes are not full-market)
+
+    def _fill_price(self, is_buy: bool, ref: float, bid: Optional[float], ask: Optional[float],
+                    symbol: Optional[str] = None, ts: Optional[str] = None) -> float:
         c = self.cfg.costs
-        if bid and ask and ask >= bid > 0 and (ask - bid) / ((ask + bid) / 2) * 1e4 <= c.max_quote_spread_bps:
+        if self.quote_spreads and bid and ask and ask >= bid > 0 and (ask - bid) / ((ask + bid) / 2) * 1e4 <= c.max_quote_spread_bps:
             base = ask if is_buy else bid
             cost = c.slippage_bps
-        else:
+        else:       # no usable quote (backtests, IEX-only quotes): the spread model, measured where possible
             base = ref
-            cost = float(one_way_cost_bps(ref, c))
+            minute = minute_of(ts) if ts else None
+            cost = float(one_way_cost_bps(ref, c, symbols=symbol if minute is not None else None, minute=minute))
         return base * (1 + cost / 1e4) if is_buy else base * (1 - cost / 1e4)
 
     def open(self, order: Order, ts: str, price: Optional[float] = None,
@@ -119,7 +123,7 @@ class PaperBroker:
         if order.symbol in self.positions or order.shares < 1:
             return None
         ref = float(price if price else order.ref_price)
-        fill = self._fill_price(order.side > 0, ref, bid, ask)
+        fill = self._fill_price(order.side > 0, ref, bid, ask, order.symbol, ts)
         return self._book_open(order, int(order.shares), fill, ref, ts)
 
     def close(self, symbol: str, ts: str, reason: str, price: Optional[float] = None,
@@ -128,7 +132,7 @@ class PaperBroker:
         if pos is None:
             return None
         ref = float(price if price else pos.last_price)
-        fill = self._fill_price(pos.side < 0, ref, bid, ask)
+        fill = self._fill_price(pos.side < 0, ref, bid, ask, symbol, ts)
         return self._book_close(symbol, pos.shares, fill, ts, reason)
 
     # ---- bookkeeping shared by the simulated and the real-broker accounts ----

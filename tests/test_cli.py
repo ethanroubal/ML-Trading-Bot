@@ -153,3 +153,46 @@ def test_alpaca_secret_is_prompted_for_when_left_out(project, monkeypatch, capsy
     assert cli.main(["status", "--alpaca-key", "PKCLI"]) == 1
     assert cli.main(["status", "--alpaca-secret", "x"]) == 1
     assert "needs --alpaca-key" in capsys.readouterr().err
+
+
+def test_scorecard_command(project, capsys):
+    import numpy as np
+    from daytrader.config import load_config
+    from daytrader import scorecard
+
+    cfg = load_config(root=str(project))
+    cal = MarketCalendar()
+    day = date(2026, 11, 13)
+    bars = normalize_bars(generate_bars(n_symbols=12, n_days=3, signal=3.0, seed=4, end_day=day))
+    store = BarStore(cfg.bar_cache_dir("yahoo"), 5)
+    store.append(bars)
+    syms = sorted(bars["symbol"].unique())
+    sess = cal.session(day)
+    from datetime import timedelta
+    for k in range(3, 60):
+        stamp = (sess.open + timedelta(minutes=5 * k)).strftime("%Y-%m-%d %H:%M ET")
+        scorecard.write_predictions(cfg.state_dir, stamp, syms, np.full(12, 50.0), np.linspace(-3, 3, 12),
+                                    np.full(12, 30.0), np.full(12, 3.0))
+    assert cli.main(["scorecard", "--date", str(day), "--universe", ",".join(syms)]) == 0
+    out = capsys.readouterr().out
+    assert "Scorecard %s" % day in out and "rank IC" in out
+    assert (cfg.report_dir / ("scorecard_%s.txt" % day)).exists()
+    assert cli.main(["scorecard", "--date", "2026-11-12", "--universe", ",".join(syms)]) == 1
+
+
+def test_spreadcheck_command(project, monkeypatch, capsys):
+    import daytrader.data as data
+
+    class Fake:
+        def raw_quotes(self, sym, start, end, feed="sip", limit=1000):
+            t = start.astimezone(__import__("datetime").timezone.utc)
+            ts = lambda s: (t + __import__("datetime").timedelta(seconds=s)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            return [{"t": ts(0), "bx": "N", "bp": 100.0, "bs": 1, "ax": "N", "ap": 100.04, "as": 1, "c": ["R"], "z": "A"},
+                    {"t": ts(1), "bx": "Q", "bp": 100.01, "bs": 1, "ax": "Q", "ap": 100.02, "as": 1, "c": ["R"], "z": "A"},
+                    {"t": ts(5), "bx": "N", "bp": 100.0, "bs": 1, "ax": "N", "ap": 100.04, "as": 1, "c": ["R"], "z": "A"}]
+
+    monkeypatch.setattr(data, "get_provider", lambda cfg: Fake())
+    assert cli.main(["spreadcheck", "--symbols", "SPY"]) == 0
+    out = capsys.readouterr().out
+    assert "SPY: 3 messages" in out and "rebuilt NBBO spread $: median 0.01" in out
+    assert (project / "reports" / "spread_check.txt").exists()

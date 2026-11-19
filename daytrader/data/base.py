@@ -22,6 +22,7 @@ class Quote:
     bid: Optional[float] = None
     ask: Optional[float] = None
     ts: Optional[datetime] = None
+    quote_ts: Optional[datetime] = None   # when the bid/ask was last updated (None if unknown)
 
 
 def empty_bars() -> pd.DataFrame:

@@ -75,16 +75,20 @@ def performance_stats(daily: pd.DataFrame, trades: pd.DataFrame, start_capital: 
     return st
 
 
-def run_backtest(panel: Panel, feats: FeatureSet, oos: pd.DataFrame, cfg: Config,
-                 capital: Optional[float] = None) -> BacktestResult:
+def run_backtest(panel: Panel, feats: FeatureSet, oos: Optional[pd.DataFrame], cfg: Config,
+                 capital: Optional[float] = None, broker: Optional[PaperBroker] = None,
+                 exp_z: Optional[np.ndarray] = None, days: Optional[np.ndarray] = None) -> BacktestResult:
+    """Trade the sessions in `oos` (or the given exp_z grid and session list).
+    Pass `broker` to continue an account across calls."""
     T, S = panel.T, panel.S
-    exp_z = np.full((T, S), np.nan)
-    exp_z[oos["t"].to_numpy(), oos["s"].to_numpy()] = oos["exp_z"].to_numpy()
-    days = np.unique(oos["day"].to_numpy())
+    if exp_z is None:
+        exp_z = np.full((T, S), np.nan)
+        exp_z[oos["t"].to_numpy(), oos["s"].to_numpy()] = oos["exp_z"].to_numpy()
+        days = np.unique(oos["day"].to_numpy())
     offsets = np.flatnonzero(np.r_[True, panel.day[1:] != panel.day[:-1], True])
     sym_idx = {s: i for i, s in enumerate(panel.symbols)}
     iv = panel.interval_min
-    broker = PaperBroker(cfg, None, capital)
+    broker = broker or PaperBroker(cfg, None, capital)
     O, Hi, Lo, C = panel.O, panel.H, panel.L, panel.C
     daily_rows: List[dict] = []
     eq_t: List[pd.Timestamp] = []
@@ -132,7 +136,7 @@ def run_backtest(panel: Panel, feats: FeatureSet, oos: pd.DataFrame, cfg: Config
             # 5) new decisions (filled next bar)
             if not flat and t + 1 < b and np.isfinite(exp_z[t]).any():
                 sig = make_signals(panel.symbols, c, exp_z[t], feats.sigH[t], feats.usable[t], cfg,
-                                   beta=feats.beta(t))
+                                   beta=feats.beta(t), minute=bar_end)
                 can_enter = (g_start <= bar_end <= g_end) and not broker.halted
                 pend_exits, pend_orders = plan(sig, broker, cfg, can_enter)
             eq_t.append(ts + pd.Timedelta(minutes=iv))

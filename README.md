@@ -40,6 +40,7 @@ by day, open positions, the latest recommendations and every trade. It refreshes
 | `./trader replay --days N` | Re-runs the last N real sessions through the live engine, using a model trained only on earlier data (separate `replay/` account) |
 | `./trader demo` | Offline demo on generated data (separate `demo/` account) |
 | `./trader report` | Performance of the paper account so far; refreshes the dashboard |
+| `./trader scorecard [--date YYYY-MM-DD]` | Grade a day's predictions against what actually happened (it also prints after every close) |
 | `./trader status` | Data source, market hours, model quality, account balance |
 | `./trader train` | Refresh data and retrain now |
 | `./trader tune` | Compare prediction horizons (30 minutes to 3 hours) after costs and say which did best |
@@ -92,10 +93,11 @@ value after costs, and never believe a number that was not measured out-of-sampl
    It predicts the next 60 minutes' return relative to the universe.
 4. **Validation.** Strictly walk-forward: train on the past, test on the days that follow,
    repeat. Model size, blend weights and the "how much to trust it" calibration are all
-   chosen on those unseen days. Predicted edges are then shrunk three ways: by the
-   measured calibration slope, by how statistically solid the evidence is, and by a flat
-   25% haircut. If validation shows no real edge, predictions shrink to about zero and the
-   trader simply stays out.
+   chosen on those unseen days. Predicted edges are then shrunk by the measured calibration
+   slope and by how statistically solid the evidence is, and optionally by a flat haircut
+   (`model.edge_haircut`, 1.0 = none; 0.75 would demand a third more predicted edge as a
+   margin for live results falling short of validation). If validation shows no real edge,
+   predictions shrink to about zero and the trader simply stays out.
    **Strongest signals** get a second look: the top 20% down to the top 0.5% are each
    checked against what actually happened, session by session. If a group did reliably
    better (or worse) than the single scaling implies - by more than three standard errors,
@@ -109,8 +111,10 @@ value after costs, and never believe a number that was not measured out-of-sampl
    equity; at most 10 positions; total exposure capped at 1x equity; beta-weighted
    long-minus-short exposure capped at 30%, so results reflect stock picking rather than
    the market's direction; a 3% daily loss flattens everything until tomorrow.
-7. **Fills.** Buys fill at the ask and sells at the bid when live quotes exist; otherwise
-   at the last price plus an assumed half-spread, and always plus slippage.
+7. **Costs and fills.** The cost hurdle uses each stock's own measured spread for that time
+   of day (see "Measured trading costs" below). Buys fill at the ask and sells at the bid
+   when live quotes exist; otherwise (backtests) at the last price plus the measured or
+   assumed half-spread; always plus slippage.
 8. **Learning.** After each close the day's bars are added and the model is retrained and
    re-validated.
 
@@ -125,7 +129,7 @@ for getting started.
 
 **Alpaca (recommended, free).** Create a free account at https://alpaca.markets, generate
 API keys, copy `.env.example` to `.env` and paste them in. The trader then switches
-automatically: real-time quotes with bid/ask, about six months of history to train on,
+automatically: real-time quotes with bid/ask, over six years of history to train on,
 and the larger universe. The free feed is IEX, one exchange's slice of the market, which
 is real-time but thinner than the full tape. These keys are used only to read market data
 (unless you also choose `--broker alpaca-paper`).
@@ -146,9 +150,17 @@ Switching from Yahoo to Alpaca:
 2. Stop the trader (Ctrl+C) and start it again with the keys.
    `./trader status --alpaca-key YOUR_KEY_ID` should say `Data provider: alpaca`.
 
-On the first Alpaca start it downloads about six months of bars for ~215 symbols (a few
-minutes) into its own cache, `data_cache/alpaca/`, separate from Yahoo's, and retrains the
-model on that history. The caches are kept apart because IEX reports only a fraction of the
+On the first Alpaca start it downloads every 5-minute bar its feed has for ~215 symbols -
+since mid-2020 on the free IEX feed (late July 2020 in practice) - into its own cache, `data_cache/alpaca/` (about
+550 MB on disk), and retrains the model on that history. Expect the download to take
+roughly 20-40 minutes (it depends on Alpaca's servers) and the first training another 10-20 minutes, with progress printed as it goes.
+
+Why 2020 and not earlier: Alpaca's free feed is IEX, and its intraday history starts in
+mid-2020. Alpaca also serves full-market (SIP) history back to 2016, but the free plan's live
+data is IEX only, and IEX reports a few percent of full-market volume. Training on one
+and trading on the other would show the model different numbers live than in training.
+With Alpaca's paid plan, set `data.alpaca_feed: sip` and the history reaches back to 2016. The download is saved a month at a time, so if it
+is interrupted (Ctrl+C, sleep, lost connection) the next start carries on where it stopped. The caches are kept apart because IEX reports only a fraction of the
 volume Yahoo does, so mixing them would distort the volume features. The paper account
 carries on as before; trades from that day on are driven by the Alpaca-trained model. To go
 back to Yahoo, set `data.provider: yahoo` in `config.yaml`.
@@ -214,6 +226,61 @@ recommendations, risk limits - is identical in all three modes.
 - A model that shows no edge in validation will mostly sit in cash; one that shows an
   edge on paper can still lose real money.
 
+## Measured trading costs
+
+A trade is only worth making if its expected move beats what it costs, so the cost
+estimate decides how often the bot trades. Most of that cost is the bid/ask spread, and
+spreads differ a lot: a one-cent spread on a $500 stock is 0.2 bp, on a $20 stock 5 bp,
+and every stock is wider in the first half hour. So instead of one assumed number for
+every stock, the trader keeps a table of each stock's actual spread in eight parts of the
+day (`data_cache/alpaca/spreads.json`).
+
+The measurements come from Alpaca's full-market (SIP) data, which is free once it is
+15 minutes old. At startup the trader samples any of the last 5 sessions it has not
+measured yet (a few seconds per session), and after every close it samples that day.
+For eight-second windows in each part of the day it takes:
+
+- the quoted national best bid and offer (rebuilt from each exchange's quotes if needed);
+- every ordinary trade on an exchange, and how far it printed from the mid-quote at that
+  moment. Twice that distance is the **effective spread**: what a trade really paid, after
+  any price improvement inside the quote.
+
+The cost used is the average effective spread, but never less than half the quoted
+spread. Off-exchange prints (dark pools, wholesalers) are left out, so improvement that
+only a wholesaler gives is not counted on. Windows with fewer than 3 trades use the full
+quoted spread. At startup the console prints the measured median round trip and the share
+of the quoted spread that trades actually paid.
+
+The free real-time feed is IEX's own order book only. Its quotes are often dollars wide on
+stocks whose real spread is a cent, so they are never used for costs, and simulated
+fills ignore them too: they pay the measured spread instead. If the measured median round
+trip is ever above 30 bp, the data is treated as broken and the assumed model is used.
+
+Each estimate is the median of the last 20 sessions' daily values and needs at least 3
+sessions; otherwise the assumed model (`min_half_spread_bps`, half a cent) is used for that
+stock and time of day. Slippage (`costs.slippage_bps`, 0.75 bp per side) is still an
+assumption. `costs.spread_source: assumed` switches measurement off.
+
+## Daily scorecard
+
+After every close the trader grades that day's predictions, all stocks at all bars,
+against what happened over the next hour. It measures exactly what the model was
+trained to predict, and it prints and saves (`reports/scorecard_<day>.txt`):
+
+- **rank IC**: did higher predictions go with better outcomes? This is the same measure as
+  the model's validation, so you can compare them directly.
+- **direction right**: the share of calls that beat the market in the predicted direction.
+- **top calls**: the 5 strongest calls each bar, with the move predicted, the move that
+  happened, and the result after cost.
+- **by predicted size**: whether bigger predictions really were followed by bigger moves.
+- **near misses**: ideas that came within 1.5 bp of the hurdle, and what they would have made.
+- **strongest calls of the day**, and the running totals since the first scorecard.
+
+One day is noise. A hundred days of rank IC near the validation figure is the evidence
+that matters. Run `./trader scorecard --date 2026-11-18` to grade a past day (needs that
+day's bars in the cache). Days before the full prediction log existed are graded from the
+top ideas in `state/signals.csv`.
+
 ## Files it writes
 
 | Path | Contents |
@@ -222,6 +289,9 @@ recommendations, risk limits - is identical in all three modes.
 | `state/trades.csv` | Every closed trade with the model's prediction next to the result |
 | `state/equity.csv` | Account value at every bar |
 | `state/signals.csv` | Every recommendation it printed |
+| `state/predictions/<day>.csv` | Every stock's prediction at every bar (graded by the scorecard) |
+| `state/scorecard.csv` | One scorecard line per session |
+| `reports/scorecard_<day>.txt` | The day's full scorecard |
 | `state/portfolio.json` | The account itself (it resumes from here after a restart) |
 | `reports/dashboard.html` | The live dashboard |
 | `models/model.json` | The latest validation report in plain text |
@@ -236,11 +306,18 @@ Everything is in `config.yaml`, with comments. The ones most worth knowing:
 - `strategy.max_gross_exposure` - 1.0 means no leverage; 2.0 doubles both gains and losses.
 - `strategy.min_edge_bps` - raise it for fewer, pickier trades.
 - `model.tail_calibration: false` - switch the strongest-signal calibration off.
-- `costs.*` - how pessimistic simulated fills are. Lowering these makes results look
-  better without making them more real.
+- `costs.*` - spreads are measured (see above); `slippage_bps` and the fallback model are
+  assumptions. Lowering them makes results look better without making them more real.
 - `model.horizon_bars` - what is predicted (12 bars = 60 minutes). `./trader tune` compares
   the alternatives on your data; trust it more as the history grows.
 - `data.universe` - `core`, `liquid`, your own list, or a text file of tickers.
+- `data.history_days` - how far back to train: a number of days, or `max`. With Alpaca the
+  default is `max` (everything its feed has). Raising it later downloads only the missing
+  older part; lowering it (for example to 1095 for three years) trains faster.
+- `model.max_dataset_rows` and `model.block_sessions` - the memory budget. With the full
+  Alpaca history, training peaks at about 4 GB of memory, and the running trader holds about
+  1 GB. If your computer struggles, set `data.history_days: 1095` (three years, about 2.5 GB),
+  or lower `max_dataset_rows` (for example to 1500000) and `block_sessions` (for example to 30).
 
 ## What to expect
 
@@ -253,8 +330,16 @@ Everything is in `config.yaml`, with comments. The ones most worth knowing:
   after costs. Read the "sessions up" column next to any impressive "net" figure: a group
   that made money in 12 of 22 sessions has not shown an edge, whatever its average. A t-statistic under about 2.5 means no dependable edge has been shown yet.
 - **Short backtests prove little.** With Yahoo's ~60 days of history the walk-forward
-  backtest covers only a few weeks. The paper account's forward record, built one real
-  day at a time, is the trustworthy test - give it a few weeks before judging.
+  backtest covers only a few weeks. With Alpaca's history it covers about four years of
+  unseen sessions, which is enough to tell a small real edge from luck. Even then,
+  the paper account's forward record, built one real day at a time, is the final test.
+- **How long histories are handled.** Features are built a few months at a time, each block
+  with a warm-up of earlier sessions so its features match a one-pass computation. To fit
+  the memory budget the model is trained and validated on every few bars rather than every
+  bar (every 11th or so with seven years of ~215 stocks). The backtest still decides on
+  every bar, like live trading: each day is predicted by the walk-forward model that had not
+  seen it. Older years cover today's stock list, so companies that later shrank or delisted
+  are missing from them; for hour-ahead, market-relative predictions that bias is small.
 - **Paper results flatter reality somewhat.** No simulated fill moves the market, shorts
   are always available, and account rules for day trading on margin are not modelled.
 - **The demo is not evidence.** Its market has a pattern planted in it on purpose so
@@ -276,8 +361,9 @@ Everything is in `config.yaml`, with comments. The ones most worth knowing:
 .venv/bin/python -m pytest tests -q
 ```
 
-76 tests: the market calendar against the NYSE schedule, data parsing, a no-look-ahead
+110 tests: the market calendar against the NYSE schedule, data parsing, a no-look-ahead
 proof for the features, broker accounting, a check that a pure random-walk market
 produces no edge and no trades, a check that a planted pattern is found and traded
 profitably, full simulated sessions through the live engine, and the Alpaca order handling against an
-imitation of Alpaca's API.
+imitation of Alpaca's API, the spread table and cost model, and the scorecard's grading
+against the training label.

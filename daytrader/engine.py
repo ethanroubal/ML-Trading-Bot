@@ -19,6 +19,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import numpy as np
 import pandas as pd
 
 from . import console as con
@@ -34,8 +35,11 @@ from .model import Model, NotEnoughData, format_report, make_dataset, train
 from .panel import build_panel
 from .report import load_state, write_dashboard
 from .strategy import make_signals, plan, recommendations, session_gates
+from . import costs as costmod
+from . import scorecard
+from .spreads import SpreadBook, bootstrap as spread_bootstrap
 
-DEFAULT_HISTORY_DAYS = {"yahoo": 58, "alpaca": 180, "replay": 3650}
+DEFAULT_HISTORY_DAYS = {"yahoo": 58, "alpaca": "max", "replay": 3650}   # alpaca: as far back as its feed goes
 SIGNAL_FIELDS = ["time", "action", "symbol", "price", "expected_bps", "cost_bps", "net_edge_bps",
                  "hit_rate", "stop"]
 
@@ -72,6 +76,7 @@ class Engine:
         self.last_recs: List[dict] = []
         self._warned: set = set()
         self._dead: set = set()        # symbols the data source has nothing for (this run)
+        self.spreads: Optional[SpreadBook] = None
 
     # ------------------------------------------------------------ utilities
     def log(self, msg: str = "") -> None:
@@ -98,13 +103,63 @@ class Engine:
             return {}
 
     # ------------------------------------------------------------- history
+    def history_start(self, now: datetime) -> datetime:
+        """Where the bar history should begin: the setting, capped by what the source serves."""
+        hd = self.cfg.data.history_days or DEFAULT_HISTORY_DAYS.get(self.provider.name, 58)
+        cap = self.provider.max_history_days
+        if str(hd).strip().lower() == "max":
+            hd = cap
+        start = now - timedelta(days=min(int(hd), cap))
+        earliest = getattr(self.provider, "earliest_date", None)
+        if earliest is not None:
+            start = max(start, datetime(earliest.year, earliest.month, earliest.day, tzinfo=ET))
+        return start
+
+    def _download(self, symbols: List[str], start: datetime, end: Optional[datetime], now: datetime,
+                  verbose: bool, label: str = "") -> set:
+        """Fetch [start, end) in month-sized windows, oldest first, saving as it goes.
+
+        Saving oldest-first makes a long download resumable: if it is interrupted, the next
+        start only fetches what is still missing after the newest saved bar."""
+        iv = self.cfg.data.interval_min
+        win = getattr(self.provider, "fetch_window_days", None)
+        stop = end or now
+        got: set = set()
+        if not win or (stop - start).days <= win:
+            df = drop_incomplete(self.provider.fetch_bars(symbols, start, end, iv), iv, now)
+            self.store.append(df)
+            return set(df["symbol"].unique()) if len(df) else set()
+        edges = [start]
+        while edges[-1] + timedelta(days=win) < stop:
+            edges.append(edges[-1] + timedelta(days=win))
+        edges.append(stop)
+        total = 0
+        t0 = datetime.now()
+        with self.store.batch():
+            for i, (lo, hi) in enumerate(zip(edges[:-1], edges[1:])):
+                last = i == len(edges) - 2
+                df = self.provider.fetch_bars(symbols, lo, None if (last and end is None) else hi - timedelta(seconds=1), iv)
+                df = drop_incomplete(df, iv, now)
+                self.store.append(df)
+                total += len(df)
+                if len(df):
+                    got |= set(df["symbol"].unique())
+                if i % 6 == 5 or last:
+                    self.store.flush()          # progress is on disk: an interruption resumes from here
+                if verbose:
+                    secs = (datetime.now() - t0).total_seconds()
+                    left = secs / (i + 1) * (len(edges) - 2 - i)
+                    self.log("    %s%s to %s: %s bars so far (%d/%d, about %s left)"
+                             % (label, lo.strftime("%Y-%m-%d"), hi.strftime("%Y-%m-%d"), format(total, ","),
+                                i + 1, len(edges) - 1, con.duration(left) if left >= 60 else "<1m"))
+        return got
+
     def sync_history(self, verbose: bool = True) -> None:
-        """Bring the local bar cache up to date."""
+        """Bring the local bar cache up to date, and extend it back in time if more history is wanted."""
         iv = self.cfg.data.interval_min
         now = self.clock.now()
-        days = self.cfg.data.history_days or DEFAULT_HISTORY_DAYS.get(self.provider.name, 58)
-        days = min(days, self.provider.max_history_days)
-        target_start = now - timedelta(days=days)
+        target_start = self.history_start(now)
+        days = (now - target_start).days
         full, lasts = [], {}
         for s in self.symbols:
             last = self.store.last_ts(s)
@@ -121,33 +176,50 @@ class Engine:
             current = [s for s, t in lasts.items() if newest - t <= pd.Timedelta(days=4)]
             stale = [s for s in lasts if s not in set(current)]
             groups = [g for g in (current, stale) if g]
-        added = 0
+
+        # extend the cache further back if the history setting asks for more than it holds
+        hist_from = self.store.get_meta("history_from")
+        if hist_from is None and lasts:
+            hist_from = min(self.store.first_ts(s) for s in lasts).tz_convert(ET).strftime("%Y-%m-%d")
+            self.store.set_meta("history_from", hist_from)
+        want_from = target_start.astimezone(ET).strftime("%Y-%m-%d")
+        if lasts and hist_from and want_from < hist_from and \
+                (datetime.strptime(hist_from, "%Y-%m-%d") - datetime.strptime(want_from, "%Y-%m-%d")).days > 3:
+            back_to = datetime.strptime(hist_from, "%Y-%m-%d").replace(tzinfo=ET)
+            if verbose:
+                self.log("  Extending history back from %s to %s for %d symbols from %s..."
+                         % (hist_from, want_from, len(lasts), self.provider.name))
+            self._download(sorted(lasts), target_start, back_to, now, verbose)
+            self.store.set_meta("history_from", want_from)
+
         if full:
             if verbose and self.provider.name == "replay":
                 self.log("  Loading history for %d symbols..." % len(full))
             elif verbose:
                 self.log("  Downloading %d days of %d-minute bars for %d symbols from %s..."
                          % (days, iv, len(full), self.provider.name))
-            df = drop_incomplete(self.provider.fetch_bars(full, target_start, None, iv), iv, now)
-            added += self.store.append(df)
-            got = set(df["symbol"].unique()) if len(df) else set()
+            got = self._download(full, target_start, None, now, verbose)
             retry = [s for s in full if s not in got]
             if retry and len(retry) < len(full):
                 if not getattr(self.clock, "simulated", False):
                     self.clock.sleep(5)      # transient rate limits usually clear quickly: one more try
-                df = drop_incomplete(self.provider.fetch_bars(retry, target_start, None, iv), iv, now)
-                added += self.store.append(df)
-                got |= set(df["symbol"].unique()) if len(df) else set()
+                got |= self._download(retry, target_start, None, now, False)
                 self._dead |= {s for s in retry if s not in got}   # don't keep asking for these
+            if not lasts or (hist_from or "9999") > want_from:
+                self.store.set_meta("history_from", want_from)
         for tail in groups:
             oldest = min(lasts[s] for s in tail)
             start = max(oldest.to_pydatetime(), target_start.astimezone(UTC))
             if (now - start).total_seconds() >= 2 * iv * 60:      # a newer bar can have completed
+                if (now - start).days > 20:
+                    # far behind (e.g. an interrupted long download): resume it in windows
+                    self._download(tail, start, None, now, verbose, label="catching up ")
+                    continue
                 df = drop_incomplete(self.provider.fetch_bars(tail, start, None, iv), iv, now)
                 rebased = self._handle_rebased(df, target_start, now)
                 if rebased:
                     df = df[~df["symbol"].isin(rebased)]
-                added += self.store.append(df)
+                self.store.append(df)
         self.active = [s for s in self.symbols if self.store.last_ts(s) is not None]
         missing = [s for s in self.symbols if s not in set(self.active)]
         if missing:
@@ -194,16 +266,27 @@ class Engine:
     # --------------------------------------------------------------- model
     def train_model(self, reason: str = ""):
         self.log(con.rule("Training model" + (" (%s)" % reason if reason else "")))
-        bars = self.store.load(self.active)
-        panel = build_panel(bars, self.cfg.data.interval_min, self.cal, asof=self.clock.now(),
-                            symbols=self.active)
-        feats = compute_features(panel, self.cfg)
-        ds = make_dataset(panel, feats, self.cfg)
-        res = train(ds, panel, self.cfg, verbose=True, provider_name=self.provider.name)
+        from .history import build_dataset
+
+        ds, info = build_dataset(self.store, self.active, self.cfg, self.cal, asof=self.clock.now(), log=self.log)
+        res = train(ds, info, self.cfg, verbose=True, provider_name=self.provider.name)
+        del ds
         res.model.save(self.model_path)
         self.model = res.model
         self.log(format_report(res.report))
-        return res, panel, feats
+        return res, info
+
+    def _cache_start(self):
+        return min(self.store.first_ts(s) for s in self.active).tz_convert(ET).date()
+
+    def _history_grew(self, meta: dict) -> bool:
+        """True when the cache now reaches well before the data the model was trained on
+        (history was extended backwards), so the saved model has not seen most of it."""
+        try:
+            trained_from = datetime.strptime(meta["train_start"], "%Y-%m-%d").date()
+            return self.active and (trained_from - self._cache_start()).days > 30
+        except Exception:
+            return False
 
     def ensure_model(self) -> None:
         model = self.model or Model.load(self.model_path)
@@ -219,6 +302,9 @@ class Engine:
             elif mt.get("provider") not in (None, "", "replay") and self.provider.name != "replay" \
                     and mt.get("provider") != self.provider.name:
                 reason = "data source changed from %s to %s" % (mt.get("provider"), self.provider.name)
+            elif self._history_grew(mt):
+                reason = "bar history now starts %s, the model was trained from %s" % (
+                    self._cache_start().strftime("%Y-%m-%d"), mt.get("train_start"))
             elif self.allow_retrain:
                 try:
                     end = datetime.strptime(mt["train_end"], "%Y-%m-%d").date()
@@ -232,6 +318,8 @@ class Engine:
             self.train_model(reason)
         else:
             self.model = model
+        self.model.use_haircut(self.cfg.model.edge_haircut)      # the setting applies without retraining
+        if not reason:
             mt = model.meta
             self.log("  Model: trained through %s, out-of-sample rank IC %+.4f (t-stat %.1f)%s"
                      % (mt["train_end"], mt["oos_rank_ic"], mt["oos_ic_tstat"],
@@ -281,6 +369,8 @@ class Engine:
             self.broker = PaperBroker(self.cfg, self.state_dir, self.capital)
             self.broker.save()
             self.log("  Paper account opened with %s of simulated money" % con.money(self.broker.start_capital))
+        # simulated fills at the live bid/ask only when those quotes are the whole market's
+        self.broker.quote_spreads = bool(getattr(self.provider, "quotes_full_market", True))
 
     def _mark_and_stops(self, quotes: Dict[str, Quote], fallback: Optional[Dict[str, float]] = None) -> List[dict]:
         """Mark positions to the latest prices; close any that hit a stop or target."""
@@ -386,7 +476,7 @@ class Engine:
         t = panel.T - 1
         exp_z = self.model.expected_z(feats.row(t))
         sig = make_signals(panel.symbols, panel.C[t], exp_z, feats.sigH[t], feats.usable[t], cfg,
-                           beta=feats.beta(t))
+                           beta=feats.beta(t), minute=b.hour * 60 + b.minute)
         recs = recommendations(sig, cfg, self.model)
         self.last_recs = recs
         g_start, g_end, g_flat = session_gates(cfg, sess.close.hour * 60 + sess.close.minute)
@@ -450,7 +540,95 @@ class Engine:
             br.save()
             self._print_account()
         self._save_signals(b, recs)
+        try:
+            scorecard.write_predictions(self.state_dir, b.strftime("%Y-%m-%d %H:%M ET"), sig.symbols, sig.price,
+                                        sig.exp_bps, sig.sigH_bps, sig.cost_bps)
+        except Exception as exc:
+            self._warn_once("preds", "prediction log not written (%s)" % exc)
         self._dashboard()
+
+    # ------------------------------------------------------------ spreads
+    def _measures_spreads(self) -> bool:
+        return self.cfg.costs.spread_source == "measured" and hasattr(self.provider, "historical_quotes")
+
+    def _spread_path(self) -> Path:
+        return self.cfg.bar_cache_dir(self.provider.name) / "spreads.json"
+
+    def load_spreads(self, bootstrap: bool = True) -> None:
+        """Load the measured spread table, sampling the quote history of recent sessions it lacks."""
+        c = self.cfg.costs
+        if not self._measures_spreads():
+            if c.spread_source == "measured" and self.provider.name not in ("replay", "synthetic"):
+                self._warn_once("spreads", "%s has no quote history: using the assumed cost model" % self.provider.name)
+            return
+        book = self.spreads or SpreadBook.load(self._spread_path(), c.spread_lookback_days, c.spread_min_days,
+                                               feed=c.spread_feed)
+        book.close_days(before=self.clock.now().astimezone(ET).date())
+        missing = [d for d in self._recent_sessions(c.spread_bootstrap_days) if str(d) not in book.sampled]
+        if bootstrap and missing:
+            self.log("  Measuring bid/ask spreads from full-market quotes (%d session%s, about %d s)..."
+                     % (len(missing), "" if len(missing) == 1 else "s", 12 * len(missing)))
+            try:
+                spread_bootstrap(book, self.provider, list(self.active or self.symbols), missing, log=self.log,
+                                 now=self.clock.now(), feed=c.spread_feed)
+            except Exception as exc:
+                self.log(con.yellow("  ! spread measurement failed (%s)" % exc))
+            book.save()
+        self.spreads = book
+        costmod.attach_book(c, book)
+        if not self._print_costs():
+            costmod.attach_book(c, None)
+
+    def _sessions_ended(self, d) -> bool:
+        sess = self.cal.session(d)
+        return sess is not None and self.clock.now() >= sess.close
+
+    def _recent_sessions(self, n: int) -> list:
+        """The last n finished sessions (today included once it has closed)."""
+        out, d = [], self.clock.now().astimezone(ET).date()
+        if not self._sessions_ended(d):
+            d = self.cal.previous_trading_day(d)
+        while len(out) < n and d is not None:
+            out.append(d)
+            d = self.cal.previous_trading_day(d)
+        return sorted(out)
+
+    def _print_costs(self) -> bool:
+        """Print measured vs assumed costs. False if the measurement looks implausible."""
+        if self.spreads is None:
+            return False
+        syms = list(self.active or self.symbols)
+        price = np.array([self._last_price(s) for s in syms], dtype=float)
+        ok = np.isfinite(price)
+        if not ok.any():
+            return True
+        syms = [s for s, k in zip(syms, ok) if k]
+        price = price[ok]
+        c = self.cfg.costs
+        mid = 12 * 60 + 30
+        meas = costmod.round_trip_cost_bps(price, c, symbols=syms, minute=mid)
+        assumed = 2.0 * (costmod.assumed_half_spread_bps(price, c) + c.slippage_bps)
+        have, n = self.spreads.coverage(syms)
+        imp = self.spreads.improvement()
+        self.log("  Costs: measured for %d/%d symbols (%d sessions). Midday round trip: median %.1f bp, cheapest "
+                 "quarter %.1f bp (old assumed model: %.1f bp)."
+                 % (have, n, self.spreads.days_measured(), float(np.median(meas)), float(np.quantile(meas, 0.25)),
+                    float(np.median(assumed))))
+        if imp is not None:
+            self.log(con.dim("         Trades paid %.0f%% of the quoted spread on average (price improvement), "
+                             "plus %.2f bp slippage per side." % (100 * imp, c.slippage_bps)))
+        if have and float(np.median(meas)) > c.spread_sanity_max_bps:
+            self.log(con.yellow("  ! a median round trip of %.1f bp means the quote data is broken - using the assumed"
+                                " model instead" % float(np.median(meas))))
+            return False
+        return True
+
+    def _last_price(self, sym: str) -> float:
+        try:
+            cur = self.store._get(sym)
+            return float(cur[1][-1][3]) if cur is not None and len(cur[0]) else np.nan
+        except Exception:
+            return np.nan
 
     def poll(self, sess: Session) -> None:
         """Between bars: watch open positions for stops, targets, the flatten time and the loss limit."""
@@ -604,6 +782,10 @@ class Engine:
             self.sync_history(verbose=False)
         except Exception as exc:
             self.log(con.yellow("  ! end-of-day data refresh failed (%s)" % exc))
+        if self.spreads is not None:
+            self.spreads.close_days()
+            self.load_spreads()         # samples today's quote history (15 minutes old by now)
+        self._scorecard(sess.day)
         if self.allow_retrain:
             try:
                 self.ensure_model()
@@ -614,6 +796,20 @@ class Engine:
         self._dashboard()
         if self.cfg.engine.dashboard:
             self.log(con.dim("  Dashboard: %s" % (self.report_dir / "dashboard.html")))
+
+    def _scorecard(self, day) -> None:
+        try:
+            lines = scorecard.run_scorecard(day, self.state_dir, self.store, list(self.active), self.cfg, self.cal,
+                                            self.report_dir, (self.model.meta or {}).get("oos_rank_ic")
+                                            if self.model else None)
+        except Exception as exc:
+            self.log(con.yellow("  ! scorecard failed (%s)" % exc))
+            return
+        if lines:
+            self.log("")
+            self.log(con.rule(lines[0]))
+            for line in lines[1:]:
+                self.log(line)
 
     def wait_for_open(self, sess: Session) -> None:
         now = self.clock.now()
@@ -656,6 +852,7 @@ class Engine:
         if self.note:
             self.log(con.yellow("  " + self.note))
         self.sync_history()
+        self.load_spreads()
         if self.force_train:
             self.train_model("fresh model for this run")
         else:

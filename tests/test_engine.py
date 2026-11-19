@@ -202,3 +202,75 @@ def test_switching_data_source_uses_its_own_cache_and_retrains(cfg, tmp_path, ba
     capsys.readouterr()
     again.ensure_model()
     assert "Training model" not in capsys.readouterr().out
+
+
+class QuotingReplay(ReplayProvider):
+    """Replay with a 2-cent bid/ask on every quote and a quote history to bootstrap from."""
+
+    def latest_quotes(self, symbols):
+        from daytrader.data.base import Quote
+        out = {}
+        for s, q in super().latest_quotes(symbols).items():
+            out[s] = Quote(q.price, q.price - 0.01, q.price + 0.01, q.ts, quote_ts=self.clock.now())
+        return out
+
+    def historical_quotes(self, symbols, start, end, feed=None):
+        return {s: [(99.99, 100.01)] for s in symbols}
+
+    def historical_trades(self, symbols, start, end, feed=None):
+        # trades at the ask and bid: they pay the whole quoted spread
+        return {s: [(None, "Q", 100.01, 100, ("@",)), (None, "N", 99.99, 100, ()), (None, "Q", 100.01, 100, ())]
+                for s in symbols}
+
+
+class IexOnlyReplay(QuotingReplay):
+    """Live quotes are a single exchange's (a dollar wide); the history is junk too."""
+    quotes_full_market = False
+
+    def historical_quotes(self, symbols, start, end, feed=None):
+        return {s: [(99.0, 101.0)] for s in symbols}
+
+    def historical_trades(self, symbols, start, end, feed=None):
+        return {s: [(None, "Q", 101.0, 100, ()), (None, "Q", 99.0, 100, ()), (None, "Q", 101.0, 100, ())]
+                for s in symbols}
+
+
+def test_engine_measures_spreads_and_writes_scorecard(cfg, tmp_path, bars, capsys):
+    clock = SimClock(datetime.combine(LAST, time(9, 20), tzinfo=ET))
+    provider = QuotingReplay(bars, clock, 5)
+    symbols = sorted(bars["symbol"].unique())
+    eng = Engine(cfg, provider, symbols, clock=clock, trade=True, capital=50_000,
+                 store=BarStore(tmp_path / "cache", 5, persist=False), state_dir=tmp_path / "state",
+                 model_path=tmp_path / "model.joblib", report_dir=tmp_path / "reports",
+                 fresh_account=True, allow_retrain=False, force_train=True, label="test")
+    eng.run(max_sessions=1)
+    out = capsys.readouterr().out
+    assert "Costs: measured for 24/24 symbols" in out and "paid 100% of the quoted spread" in out
+    assert "Scorecard %s" % LAST in out and "rank IC" in out
+    assert eng.spreads.days_measured() == cfg.costs.spread_bootstrap_days + 1     # history + today after the close
+    assert eng.spreads.improvement() == pytest.approx(1.0)                        # trades paid the full spread
+    assert (cfg.bar_cache_dir("replay") / "spreads.json").exists()
+    preds = pd.read_csv(tmp_path / "state" / "predictions" / ("%s.csv" % LAST))
+    assert preds["symbol"].nunique() == 24 and preds["time"].nunique() > 60
+    assert (tmp_path / "state" / "scorecard.csv").exists()
+    sig = pd.read_csv(tmp_path / "state" / "signals.csv")
+    # every quote was 2 cents wide (2 bp at $100 in the quote history): half spread = max(1 bp, 1 cent)
+    px = sig["price"].astype(float)
+    expect = 2 * (np.maximum(1.0, 100.0 / px) + cfg.costs.slippage_bps)
+    assert np.allclose(sig["cost_bps"], expect, atol=0.11)
+
+
+def test_implausible_spreads_fall_back_and_iex_quotes_are_not_used(cfg, tmp_path, bars, capsys):
+    from daytrader import costs as costmod
+
+    clock = SimClock(datetime.combine(LAST, time(9, 20), tzinfo=ET))
+    provider = IexOnlyReplay(bars, clock, 5)
+    eng = Engine(cfg, provider, sorted(bars["symbol"].unique()), clock=clock, trade=True, capital=50_000,
+                 store=BarStore(tmp_path / "cache", 5, persist=False), state_dir=tmp_path / "state",
+                 model_path=tmp_path / "model.joblib", report_dir=tmp_path / "reports",
+                 fresh_account=True, allow_retrain=False, force_train=True, label="test")
+    eng.startup()
+    out = capsys.readouterr().out
+    assert "the quote data is broken" in out
+    assert costmod.book_of(cfg.costs) is None              # assumed model in use
+    assert eng.broker.quote_spreads is False                # no fills at IEX bid/ask

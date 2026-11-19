@@ -24,6 +24,7 @@ import pandas as pd
 
 from .config import Config
 from .costs import round_trip_cost_bps
+from .market_calendar import OPEN_MIN
 from .features import FeatureSet
 from .panel import Panel
 
@@ -47,12 +48,35 @@ class Dataset:
     s: np.ndarray           # (n,) symbol index
     k: np.ndarray           # (n,) bar index within session
     names: List[str]
+    stride: int = 1         # only every `stride`-th bar was kept (long histories, to fit in memory)
 
 
-def make_dataset(panel: Panel, feats: FeatureSet, cfg: Config) -> Dataset:
+def make_dataset(panel: Panel, feats: FeatureSet, cfg: Config, keep_days: Optional[np.ndarray] = None,
+                 day_index: Optional[np.ndarray] = None, stride: int = 1) -> Dataset:
+    """Labelled rows of a panel.
+
+    keep_days: bool per panel day - which sessions to take rows from (block-wise building);
+    day_index: global session number of each panel day; rows then get t = day * 1000 + k,
+               a bar id that is unique across blocks;
+    stride:    keep only bars with k % stride == day % stride (rotates through the day).
+    """
     mask = feats.usable & np.isfinite(feats.y)
-    mask &= (panel.day >= cfg.model.warmup_days)[:, None]
+    gday = panel.day if day_index is None else np.asarray(day_index)[panel.day]
+    rows = gday >= cfg.model.warmup_days
+    if keep_days is not None:
+        rows &= np.asarray(keep_days)[panel.day]
+    if stride > 1:
+        rows &= (panel.k % stride) == (gday % stride)
+    mask &= rows[:, None]
     t_idx, s_idx = np.nonzero(mask)
+    if day_index is not None:
+        return Dataset(
+            X=feats.matrix(mask), y=feats.y[mask].astype(np.float32),
+            rel_bps=(feats.fwd_rel[mask] * 1e4).astype(np.float32),
+            sigH_bps=(feats.sigH[mask] * 1e4).astype(np.float32),
+            price=panel.C[mask].astype(np.float32),
+            day=gday[t_idx], t=gday[t_idx] * 1000 + panel.k[t_idx], s=s_idx, k=panel.k[t_idx],
+            names=list(feats.names), stride=stride)
     return Dataset(
         X=feats.matrix(mask),
         y=feats.y[mask].astype(np.float32),
@@ -174,12 +198,24 @@ class Model:
         return apply_calibration(self.raw_predict(X), self.slope * self.evidence, self.haircut,
                                  self.calib_x, self.calib_g)
 
+    def use_haircut(self, haircut: float) -> None:
+        """Apply a different haircut without retraining (the calibration does not depend on it)."""
+        if not hasattr(self, "haircut_trained"):
+            self.haircut_trained = self.haircut
+        self.haircut = float(haircut)
+
+    def _as_trained(self, exp_z: np.ndarray) -> np.ndarray:
+        """|exp_z| on the scale the hit-rate and strength tables were built with."""
+        ht = getattr(self, "haircut_trained", self.haircut)
+        scale = ht / self.haircut if self.haircut > 0 and ht > 0 else 1.0
+        return np.abs(exp_z) * scale
+
     def p_win(self, exp_z: np.ndarray) -> np.ndarray:
-        return np.interp(np.abs(exp_z), self.pwin_x, self.pwin_y)
+        return np.interp(self._as_trained(exp_z), self.pwin_x, self.pwin_y)
 
     def strength(self, exp_z: np.ndarray) -> np.ndarray:
         """Percentile (0-100) of this signal's size among validation signals."""
-        return np.searchsorted(self.abs_quantiles, np.abs(exp_z), side="right") - 1.0
+        return np.searchsorted(self.abs_quantiles, self._as_trained(exp_z), side="right") - 1.0
 
     @property
     def has_edge(self) -> bool:
@@ -385,12 +421,33 @@ class TrainResult:
     model: Model
     oos: pd.DataFrame            # walk-forward predictions: t, s, day, exp_z (NaN in the calibration fold)
     report: Dict[str, Any] = field(default_factory=dict)
+    folds: List[Dict[str, Any]] = field(default_factory=list)   # walk-forward models, for full-resolution backtests
+    ckpts: Optional[np.ndarray] = None
+    haircut: float = 1.0
+
+
+def fold_predict(fold: Dict[str, Any], X: np.ndarray, ckpts: np.ndarray, haircut: float) -> np.ndarray:
+    """Walk-forward expected move for rows of fold `fold`, using only that fold's models and the
+    settings chosen on earlier folds - what the model would have said on those days, nothing more."""
+    c = fold["c"]
+    raw = np.zeros(len(X))
+    if len(X) == 0:
+        return raw
+    if c["w_gb"] > 0:
+        target = int(ckpts[c["j"]])
+        for it, pred in enumerate(fold["gb"].staged_predict(X), start=1):
+            if it == target:
+                raw += c["w_gb"] * pred
+                break
+    if c["w_lin"] > 0:
+        raw += c["w_lin"] * fold["lin"].predict_all(X)[:, c["a"]]
+    return apply_calibration(raw, c["scale"], haircut, c["kx"], c["kg"])
 
 
 def _train_mask(ds: Dataset, rows: np.ndarray, cfg: Config, rng: np.random.Generator) -> np.ndarray:
     idx = np.flatnonzero(rows)
     se = max(1, cfg.model.sample_every)
-    if se > 1:
+    if se > 1 and ds.stride < se:
         idx = idx[(ds.k[idx] % se) == 0]
     if len(idx) > cfg.model.max_train_rows:
         idx = np.sort(rng.choice(idx, cfg.model.max_train_rows, replace=False))
@@ -423,6 +480,7 @@ def train(ds: Dataset, panel: Panel, cfg: Config, verbose: bool = True,
         print("  Walk-forward validation: %d folds, first %d sessions train-only" % (n_folds, min_train))
 
     fold_id = np.full(len(ds.y), -1, dtype=np.int16)
+    folds: List[Dict[str, Any]] = []
     p_gb = np.full((len(ds.y), len(ckpts)), np.nan, dtype=np.float32)
     p_lin = np.full((len(ds.y), len(RIDGE_ALPHAS)), np.nan, dtype=np.float32)
     for f, block in enumerate(blocks):
@@ -440,6 +498,7 @@ def train(ds: Dataset, panel: Panel, cfg: Config, verbose: bool = True,
         lin = Ridge().fit(ds.X[tr], ds.y[tr])
         p_lin[te] = lin.predict_all(ds.X[te])
         fold_id[te] = f
+        folds.append({"f": f, "first": int(block[0]), "last": int(block[-1]), "gb": gb, "lin": lin, "c": None})
         if verbose:
             yt = ds.y[te].astype(float)
             c_gb = max(_corr(p_gb[te, j].astype(float), yt) for j in range(len(ckpts)))
@@ -481,6 +540,10 @@ def train(ds: Dataset, panel: Panel, cfg: Config, verbose: bool = True,
         if prev.sum() < 500 or cur.sum() == 0:
             continue
         c = choose(prev)
+        for fd in folds:
+            if fd["f"] == f:
+                fd["c"] = {"j": c["j"], "a": c["a"], "w_gb": c["w_gb"], "w_lin": c["w_lin"],
+                           "scale": c["slope"] * c["evidence"], "kx": c["kx"], "kg": c["kg"]}
         raw = c["w_gb"] * p_gb[cur, c["j"]].astype(float) + c["w_lin"] * p_lin[cur, c["a"]].astype(float)
         exp_z[cur] = apply_calibration(raw, c["slope"] * c["evidence"], m.edge_haircut, c["kx"], c["kg"])
 
@@ -491,13 +554,17 @@ def train(ds: Dataset, panel: Panel, cfg: Config, verbose: bool = True,
     n_ic_days = c["days"]
     exp_all = apply_calibration(blend, slope * evidence, m.edge_haircut, c["kx"], c["kg"])
     exp_bps = exp_all * ds.sigH_bps[oos_rows].astype(float)
-    cost = round_trip_cost_bps(ds.price[oos_rows].astype(float), cfg.costs)
+    syms = getattr(panel, "symbols", None)
+    cost = round_trip_cost_bps(ds.price[oos_rows].astype(float), cfg.costs,
+                               symbols=np.asarray(syms, dtype=object)[ds.s[oos_rows]] if syms is not None else None,
+                               minute=OPEN_MIN + (ds.k[oos_rows].astype(int) + 1) * cfg.data.interval_min)
     table = edge_table(exp_bps, ds.rel_bps[oos_rows].astype(float), cost, ds.day[oos_rows])
 
     model = Model()
     model.names = list(ds.names)
     model.w_gb, model.w_lin, model.slope, model.haircut = w_gb, w_lin, slope, m.edge_haircut
     model.evidence = evidence
+    model.haircut_trained = m.edge_haircut
     model.calib_x, model.calib_g = c["kx"], c["kg"]
     n_iter = int(min(m.max_iter, round(ckpts[j] * 1.1)))
     if fit_final:
@@ -560,7 +627,8 @@ def train(ds: Dataset, panel: Panel, cfg: Config, verbose: bool = True,
         "train_seconds": round(_time.time() - t0, 1),
     }
     oos = pd.DataFrame({"t": ds.t[wf], "s": ds.s[wf], "day": ds.day[wf], "exp_z": exp_z[wf]})
-    return TrainResult(model=model, oos=oos, report=model.meta)
+    return TrainResult(model=model, oos=oos, report=model.meta, folds=[fd for fd in folds if fd["c"] is not None],
+                       ckpts=ckpts, haircut=m.edge_haircut)
 
 
 def _top_label(group: str) -> str:
@@ -581,8 +649,8 @@ def format_report(meta: Dict[str, Any]) -> str:
     tail = [d for d in meta.get("tail_calibration") or [] if d["group"].split("-")[0] not in ("0", "50")]
     if tail:
         h = meta.get("edge_haircut", 1.0)
-        lines.append("    Strongest-signal calibration (expected move per trade, after the %.0f%% haircut):"
-                     % (100 * (1 - h)))
+        lines.append("    Strongest-signal calibration (expected move per trade%s):"
+                     % (", after the %.0f%% haircut" % (100 * (1 - h)) if h < 1 else ""))
         for d in tail:
             plain = h * d["plain_z"] * d["sigH_bps"]
             cal = h * d["calibrated_z"] * d["sigH_bps"]

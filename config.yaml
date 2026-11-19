@@ -4,8 +4,9 @@
 data:
   provider: auto          # auto | alpaca | yahoo   (auto = alpaca when keys are in .env, else yahoo)
   interval_min: 5         # bar size in minutes
-  history_days: 0         # calendar days of history to train on; 0 = most the source allows
-                          #   (yahoo: ~58 days, alpaca: 180 days by default, up to 400)
+  history_days: 0         # calendar days of history to train on, or "max"; 0 = the default for the source
+                          #   (yahoo: ~58 days, the most it serves; alpaca: "max" = since 2020 on the free
+                          #    IEX feed, since 2016 on the paid SIP feed)
   alpaca_feed: iex        # iex = free real-time feed | sip = paid full-market feed
   universe: auto          # auto | core (~70 names) | liquid (~200 names) | [AAPL, MSFT, ...] | tickers.txt
   request_pause: 0.3      # seconds between Yahoo request batches (raise if you get rate-limited)
@@ -17,6 +18,9 @@ model:
   target: relative        # relative = move versus the rest of the universe | raw = outright move
   sample_every: 2         # train on every Nth bar (neighbouring bars are nearly duplicates)
   max_train_rows: 1500000
+  max_dataset_rows: 2500000  # memory budget (~0.8 GB): long histories keep every Nth bar to fit
+  block_sessions: 60      # long histories are processed this many sessions at a time
+  block_warmup_sessions: 35  # earlier sessions loaded with each block so its features start warm
   n_folds: 5              # walk-forward validation blocks
   min_train_days: 0       # 0 = auto
   warmup_days: 5
@@ -28,7 +32,8 @@ model:
   max_features: 0.6
   max_bins: 63
   seeds: 3                # models averaged in the final ensemble
-  edge_haircut: 0.75      # predicted edges are multiplied by this (live edges decay vs. validation)
+  edge_haircut: 1.0       # predicted edges are multiplied by this; below 1.0 (e.g. 0.75) = a margin for
+                          #   live edges being smaller than validated ones. Takes effect without retraining.
   tail_calibration: true  # let the strongest signals carry bigger edges when validation backs it up
   retrain_every_days: 1   # retrain after this many new sessions
 
@@ -54,10 +59,19 @@ strategy:
   min_price: 5.0
   top_n: 5                # recommendations shown per side
 
-costs:                    # what a simulated fill costs when no live bid/ask is available
-  min_half_spread_bps: 0.75
-  tick_half_spread: 0.005 # half of a one-cent spread, in dollars
-  slippage_bps: 0.75      # extra slippage per side
+costs:                    # what a trade is expected to cost: half the bid/ask spread + slippage, per side
+  spread_source: measured # measured = each stock's own spread by time of day, from Alpaca's full-market
+                          #   quotes (free when 15+ minutes old); falls back to the assumed model below
+                          #   where there is too little data | assumed
+  min_half_spread_bps: 0.75   # assumed model: half spread is at least this...
+  tick_half_spread: 0.005 # ...and at least half a cent (in dollars) - also a floor on measured spreads
+  measured_min_half_spread_bps: 0.2  # floor on a measured half spread
+  spread_lookback_days: 20    # sessions of spread history behind each estimate
+  spread_min_days: 3      # sessions of measurements needed before a stock's measured spread is used
+  spread_bootstrap_days: 5    # recent sessions whose quote history is sampled (at startup and after each close)
+  spread_feed: sip        # sip = national best bid/offer. Never iex: IEX's own book is far wider than the market's
+  spread_sanity_max_bps: 30   # a measured median round trip above this means broken data: use the assumed model
+  slippage_bps: 0.75      # extra slippage per side (assumed - not measured)
   commission_per_share: 0.0
   max_quote_spread_bps: 30.0  # live quotes wider than this are treated as unreliable
 

@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional
 class DataCfg:
     provider: str = "auto"          # auto | alpaca | yahoo  (auto = alpaca when keys are present)
     interval_min: int = 5           # bar size in minutes
-    history_days: int = 0           # calendar days of history to train on; 0 = provider default
+    history_days: Any = 0           # calendar days of history to train on; 0 = provider default; "max" = all
     alpaca_feed: str = "iex"        # iex (free, real-time) | sip (paid, full market)
     universe: Any = "auto"          # auto | core | liquid | [list of tickers] | path to a text file
     request_pause: float = 0.3      # seconds between Yahoo request batches
@@ -29,6 +29,9 @@ class ModelCfg:
     target: str = "relative"        # relative (vs. universe average) | raw
     sample_every: int = 2           # use every Nth bar for training (labels overlap heavily)
     max_train_rows: int = 1_500_000
+    max_dataset_rows: int = 2_500_000  # memory budget: long histories keep every Nth bar to fit
+    block_sessions: int = 60        # long histories are processed this many sessions at a time
+    block_warmup_sessions: int = 35  # earlier sessions loaded with each block so features start warm
     n_folds: int = 5                # walk-forward test blocks
     min_train_days: int = 0         # 0 = auto (40% of history, at least 15 days)
     warmup_days: int = 5            # skip the first days (rolling features still warming up)
@@ -40,7 +43,7 @@ class ModelCfg:
     max_features: float = 0.6
     max_bins: int = 63
     seeds: int = 3                  # bagged models in the final ensemble
-    edge_haircut: float = 0.75      # shrink calibrated edge (live edges decay vs. validation)
+    edge_haircut: float = 1.0       # multiply calibrated edges by this (below 1 = margin for live decay)
     tail_calibration: bool = True   # calibrate the strongest signals on their own validation evidence
     retrain_every_days: int = 1     # retrain when the model is older than this many sessions
 
@@ -76,6 +79,13 @@ class CostCfg:
     slippage_bps: float = 0.75         # extra slippage per side on top of the spread
     commission_per_share: float = 0.0
     max_quote_spread_bps: float = 30.0  # ignore live quotes wider than this (use the model instead)
+    spread_source: str = "measured"     # measured = per-stock, time-of-day spreads from Alpaca quotes | assumed
+    measured_min_half_spread_bps: float = 0.2  # floor on a measured half spread
+    spread_lookback_days: int = 20      # sessions of spread history behind each estimate
+    spread_min_days: int = 3            # sessions needed before a measured estimate replaces the assumed one
+    spread_bootstrap_days: int = 5      # recent sessions whose quote history is sampled (missing ones only)
+    spread_feed: str = "sip"            # quotes to measure spreads from: sip = national best bid/offer
+    spread_sanity_max_bps: float = 30.0  # a measured median round trip above this means broken data: use the assumed model
 
 
 @dataclass
@@ -218,10 +228,15 @@ def load_config(path: Optional[str] = None, root: Optional[str] = None) -> Confi
 def validate(cfg: Config) -> None:
     if 390 % cfg.data.interval_min != 0:
         raise ConfigError("data.interval_min must divide 390 (e.g. 1, 5, 15, 30).")
+    hd = cfg.data.history_days
+    if not (isinstance(hd, int) and hd >= 0) and str(hd).strip().lower() != "max":
+        raise ConfigError("data.history_days must be a number of days, 0 (the default) or \"max\".")
     if cfg.model.horizon_bars < 1:
         raise ConfigError("model.horizon_bars must be at least 1.")
     if cfg.model.target not in ("relative", "raw"):
         raise ConfigError("model.target must be 'relative' or 'raw'.")
+    if cfg.costs.spread_source not in ("measured", "assumed"):
+        raise ConfigError("costs.spread_source must be 'measured' or 'assumed'.")
     if cfg.broker.mode not in BROKER_MODES:
         raise ConfigError("broker.mode must be one of: %s." % ", ".join(BROKER_MODES))
     if cfg.broker.order_type not in ("limit", "market"):

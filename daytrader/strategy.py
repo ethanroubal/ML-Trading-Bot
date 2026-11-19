@@ -35,11 +35,14 @@ class Signals:
 
 
 def make_signals(symbols: List[str], price: np.ndarray, exp_z: np.ndarray, sigH: np.ndarray,
-                 usable: np.ndarray, cfg: Config, beta: Optional[np.ndarray] = None) -> Signals:
+                 usable: np.ndarray, cfg: Config, beta: Optional[np.ndarray] = None,
+                 minute: Optional[int] = None) -> Signals:
+    """minute: when the trade would happen (minutes after midnight ET), for measured spreads."""
     price = np.asarray(price, dtype=float)
     sigH_bps = np.asarray(sigH, dtype=float) * 1e4
     exp_bps = np.asarray(exp_z, dtype=float) * sigH_bps
-    cost = 2.0 * one_way_cost_bps(np.where(np.isfinite(price), price, 1.0), cfg.costs)
+    cost = 2.0 * one_way_cost_bps(np.where(np.isfinite(price), price, 1.0), cfg.costs,
+                                  symbols=symbols, minute=minute)
     ok = np.asarray(usable, dtype=bool) & np.isfinite(exp_bps) & np.isfinite(price) & (price >= cfg.strategy.min_price)
     edge = np.where(ok, np.abs(exp_bps) - cost, np.nan)
     return Signals(list(symbols), price, np.where(ok, exp_bps, np.nan), sigH_bps, cost, edge, ok, beta)

@@ -5,6 +5,8 @@ import argparse
 import os
 import sys
 from datetime import datetime, time
+
+from .market_calendar import UTC
 from pathlib import Path
 from typing import List, Optional
 
@@ -173,24 +175,32 @@ def cmd_train(args) -> int:
     cfg = _load(args)
     eng = _engine(cfg, trade=False)
     eng.sync_history()
+    eng.load_spreads()
     eng.train_model("requested")
     return 0
 
 
 def cmd_backtest(args) -> int:
-    from .backtest import format_stats, run_backtest
+    from .backtest import format_stats
+    from .history import backtest_history
     from .report import write_backtest_report
 
     cfg = _load(args)
     eng = _engine(cfg, trade=False)
     eng.sync_history()
-    res, panel, feats = eng.train_model("walk-forward backtest")
-    bt = run_backtest(panel, feats, res.oos, cfg, capital=cfg.strategy.capital)
+    eng.load_spreads()
+    res, info = eng.train_model("walk-forward backtest")
+    print("  Running the walk-forward backtest...")
+    bt = backtest_history(eng.store, info, res, cfg, eng.cal, asof=eng.clock.now(), capital=cfg.strategy.capital)
     print(con.rule("Walk-forward backtest"))
     print(format_stats(bt.stats, "Out-of-sample results (after simulated spread + slippage)"))
     n = bt.stats.get("days", 0)
     note = ("%d out-of-sample sessions. Each was traded by a model fitted only on earlier data, with "
             "fills at the next bar's open plus spread and slippage." % n)
+    if bt.stats.get("decision_every_bars", 1) > 1:
+        k = bt.stats["decision_every_bars"]
+        note += (" Predictions were made every %d bars, so the backtest re-decides every %d minutes"
+                 " (live trading re-decides every bar)." % (k, k * cfg.data.interval_min))
     if n < 60:
         note += " This is a SMALL sample: day-to-day luck dominates over a few weeks, so treat it as a sanity check, not a forecast."
     print("  " + con.dim(note))
@@ -203,16 +213,14 @@ def cmd_tune(args) -> int:
     """Compare prediction horizons on the same history, after costs."""
     import copy
 
-    from .backtest import run_backtest
-    from .features import compute_features
-    from .model import SELECTION_ALLOWANCE, NotEnoughData, make_dataset, train
-    from .panel import build_panel
+    from .history import backtest_history, build_dataset
+    from .model import SELECTION_ALLOWANCE, NotEnoughData, train
 
     cfg = _load(args)
     eng = _engine(cfg, trade=False)
     eng.sync_history()
+    eng.load_spreads()
     iv = cfg.data.interval_min
-    panel = build_panel(eng.store.load(eng.active), iv, eng.cal, asof=eng.clock.now(), symbols=eng.active)
     horizons = [int(h) for h in args.horizons.split(",")] if args.horizons else \
         sorted({max(1, 30 // iv), max(1, 60 // iv), max(2, 120 // iv), max(3, 180 // iv)})
     print(con.rule("Horizon comparison (walk-forward, after simulated costs)"))
@@ -222,12 +230,13 @@ def cmd_tune(args) -> int:
         c = copy.deepcopy(cfg)
         c.model.horizon_bars = h
         try:
-            feats = compute_features(panel, c)
-            res = train(make_dataset(panel, feats, c), panel, c, verbose=False, fit_final=False)
+            ds, info = build_dataset(eng.store, eng.active, c, eng.cal, asof=eng.clock.now(), log=None)
+            res = train(ds, info, c, verbose=False, fit_final=False)
+            del ds
         except NotEnoughData as exc:
             print("  %-9s %s" % ("%d min" % (h * iv), exc))
             continue
-        bt = run_backtest(panel, feats, res.oos, c, capital=c.strategy.capital)
+        bt = backtest_history(eng.store, info, res, c, eng.cal, asof=eng.clock.now(), capital=c.strategy.capital)
         r, st = res.report, bt.stats
         top = r["edge_table"][-1]["net_bps"] if r.get("edge_table") else float("nan")
         rows.append((h, r, st))
@@ -269,6 +278,9 @@ def _sim_engine(cfg: Config, bars, symbols: List[str], start_day, speed: float, 
                   fresh_account=True, allow_retrain=False, force_train=True, label=label, note=note)
 
 
+REPLAY_HISTORY_DAYS = 400     # calendar days of history a replay trains on
+
+
 def cmd_replay(args) -> int:
     """Run past sessions from the bar cache through the live engine."""
     from .data.store import BarStore
@@ -277,9 +289,12 @@ def cmd_replay(args) -> int:
     cfg = _load(args)
     eng = _engine(cfg, trade=False)
     eng.sync_history()
-    bars = eng.store.load(eng.active)
+    from datetime import date as _date, timedelta as _td
+
+    import pandas as pd
+
     cal = MarketCalendar(cfg.calendar.extra_holidays, cfg.calendar.extra_early_closes)
-    days = sorted(set(bars["ts"].dt.tz_convert(ET).dt.date))
+    days = [_date(1970, 1, 1) + _td(days=int(d)) for d in eng.store.session_days(eng.active)]
     now = now_et()
     sess = cal.session(now.date())
     if days and days[-1] == now.date() and sess is not None and now < sess.close:
@@ -289,6 +304,9 @@ def cmd_replay(args) -> int:
         print("Not enough cached history to replay %d session(s) (have %d sessions)." % (n, len(days)))
         return 1
     start = days[-n]
+    # A replay only needs the year before it: keeps memory modest with a multi-year Alpaca cache.
+    since = pd.Timestamp(start - _td(days=REPLAY_HISTORY_DAYS), tz="UTC")
+    bars = eng.store.load(eng.active, start=since)
     sim = _sim_engine(cfg, bars, eng.active, start, args.speed, cfg.strategy.capital, "replay",
                       "replay of %d past session(s)" % n,
                       "Replay of real past sessions. The model was trained only on data before %s." % start)
@@ -413,6 +431,92 @@ def cmd_status(args) -> int:
     return 0
 
 
+def cmd_scorecard(args) -> int:
+    """Grade a day's predictions against what happened (default: the latest session)."""
+    from .data import resolve_provider_name
+    from .data.store import BarStore
+    from .market_calendar import MarketCalendar, now_et
+    from .scorecard import run_scorecard
+    from .universe import resolve_universe
+
+    cfg = _load(args)
+    name = resolve_provider_name(cfg)
+    cal = MarketCalendar(cfg.calendar.extra_holidays, cfg.calendar.extra_early_closes)
+    if args.date:
+        day = datetime.strptime(args.date, "%Y-%m-%d").date()
+    else:
+        now = now_et()
+        day = now.date()
+        sess = cal.session(day)
+        if sess is None or now < sess.close:
+            day = cal.previous_trading_day(day)
+    state_dir, report_dir = cfg.state_dir, cfg.report_dir
+    if args.broker and args.broker != "sim":
+        state_dir, report_dir = _broker_dirs(cfg, args.broker)
+    store = BarStore(cfg.bar_cache_dir(name), cfg.data.interval_min)
+    symbols = [s for s in resolve_universe(cfg.data.universe, name, cfg.root) if store.last_ts(s) is not None]
+    model_ic = None
+    try:        # the validation report is plain JSON - no need to load the model itself
+        import json
+        model_ic = json.loads((cfg.model_dir / "model.json").read_text()).get("oos_rank_ic")
+    except Exception:
+        pass
+    lines = run_scorecard(day, state_dir, store, symbols, cfg, cal, report_dir, model_ic)
+    if not lines:
+        print("No predictions recorded for %s." % day)
+        return 1
+    print(con.rule(lines[0]))
+    for line in lines[1:]:
+        print(line)
+    return 0
+
+
+def cmd_spreadcheck(args) -> int:
+    """Dump raw full-market quotes for a few stocks so the spread measurement can be checked."""
+    import json
+    from collections import Counter
+    from datetime import timedelta
+
+    from .data import get_provider
+    from .market_calendar import ET, MarketCalendar, now_et
+    from .spreads import nbbo_spreads, spread_of
+
+    cfg = _load(args)
+    cfg.data.provider = "alpaca"
+    prov = get_provider(cfg)
+    cal = MarketCalendar(cfg.calendar.extra_holidays, cfg.calendar.extra_early_closes)
+    day = now_et().date()
+    if cal.session(day) is None or now_et() < cal.session(day).close + timedelta(minutes=16):
+        day = cal.previous_trading_day(day)
+    start = datetime.combine(day, time(12, 30), tzinfo=ET)
+    end = start + timedelta(seconds=8)
+    warm = (start + timedelta(seconds=4)).astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+    lines = ["Spread check: %s 12:30:00-12:30:08 ET, feed=sip" % day]
+    for sym in (args.symbols or "SPY,AAPL,NVDA,KO,AMD").split(","):
+        rows = prov.raw_quotes(sym.strip().upper(), start, end)
+        n = len(rows)
+        same = sum(1 for r in rows if r.get("bx") == r.get("ax"))
+        per = sorted(round(sp[1], 4) for sp in (spread_of(r.get("bp"), r.get("ap")) for r in rows) if sp)
+        nb = sorted(round(u, 4) for _, u in nbbo_spreads(
+            [(r.get("t"), r.get("bx"), r.get("bp"), r.get("bs"), r.get("ax"), r.get("ap"), r.get("as")) for r in rows], warm))
+        med = lambda v: v[len(v) // 2] if v else None
+        lines.append("")
+        lines.append("%s: %d messages, bid and ask on the same exchange in %d; exchanges %s; conditions %s; tapes %s"
+                     % (sym, n, same, dict(Counter(r.get("bx") for r in rows)),
+                        dict(Counter(tuple(r.get("c") or []) for r in rows)), dict(Counter(r.get("z") for r in rows))))
+        lines.append("  per-message spread $: median %s, min %s, max %s" % (med(per), per[0] if per else None, per[-1] if per else None))
+        lines.append("  rebuilt NBBO spread $: median %s, min %s, max %s (%d points)" % (med(nb), nb[0] if nb else None, nb[-1] if nb else None, len(nb)))
+        for r in rows[:12]:
+            lines.append("  " + json.dumps(r, sort_keys=True))
+    text = "\n".join(lines) + "\n"
+    out = cfg.report_dir / "spread_check.txt"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(text)
+    print(text)
+    print("Saved to %s" % out)
+    return 0
+
+
 def cmd_reset(args) -> int:
     from .broker import PaperBroker
 
@@ -480,6 +584,13 @@ def build_parser() -> argparse.ArgumentParser:
     fl.add_argument("--broker", choices=["alpaca-paper", "alpaca-live"], help="which Alpaca account")
     fl.set_defaults(fn=cmd_flatten)
     sub.add_parser("fetch", parents=[common], help="download/refresh market history only").set_defaults(fn=cmd_fetch)
+    sc = sub.add_parser("scorecard", parents=[common], help="grade a day's predictions against what actually happened")
+    sc.add_argument("--date", help="session to grade, YYYY-MM-DD (default: the latest finished session)")
+    sc.add_argument("--broker", choices=["sim", "alpaca-paper", "alpaca-live"], help="which account (default: sim)")
+    sc.set_defaults(fn=cmd_scorecard)
+    spc = sub.add_parser("spreadcheck", parents=[common], help="dump raw full-market quotes to check spread measurement")
+    spc.add_argument("--symbols", help="comma-separated (default SPY,AAPL,NVDA,KO,AMD)")
+    spc.set_defaults(fn=cmd_spreadcheck)
     sub.add_parser("reset", parents=[common], help="archive the paper account and start a new one").set_defaults(fn=cmd_reset)
     return p
 

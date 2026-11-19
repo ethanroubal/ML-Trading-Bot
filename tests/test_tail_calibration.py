@@ -77,3 +77,18 @@ def test_model_without_knots_behaves_as_before():
     m.slope, m.evidence, m.haircut = 0.5, 0.8, 0.75
     raw = np.array([-1.0, 0.0, 2.0])
     assert np.allclose(apply_calibration(raw, m.slope * m.evidence, m.haircut, None, None), 0.3 * raw)
+
+
+def test_haircut_can_change_without_retraining():
+    m = Model()
+    m.slope, m.evidence, m.haircut, m.haircut_trained = 0.5, 1.0, 0.75, 0.75
+    m.pwin_x, m.pwin_y = np.array([0.0, 0.1, 0.2]), np.array([0.5, 0.55, 0.6])
+    m.abs_quantiles = np.linspace(0, 0.2, 101)
+    m.raw_predict = lambda X: np.asarray(X, dtype=float)
+    before_z = m.expected_z(np.array([0.2]))
+    before_p, before_s = m.p_win(before_z), m.strength(before_z)
+    m.use_haircut(1.0)
+    after_z = m.expected_z(np.array([0.2]))
+    assert after_z[0] == pytest.approx(before_z[0] / 0.75)          # bigger expected move...
+    assert m.p_win(after_z) == pytest.approx(before_p)               # ...same signal, same hit rate
+    assert m.strength(after_z) == pytest.approx(before_s)

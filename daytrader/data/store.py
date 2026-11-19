@@ -6,7 +6,9 @@ trader runs adds another day to the cache).
 """
 from __future__ import annotations
 
+import json
 import os
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -33,6 +35,9 @@ class BarStore:
         if persist:
             self.dir.mkdir(parents=True, exist_ok=True)
         self._mem: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+        self._dirty: set = set()        # symbols changed in memory but not yet written (batch mode)
+        self._batch = 0
+        self._meta: Optional[dict] = None
 
     # ---- internals -------------------------------------------------------
     def _file(self, symbol: str) -> Path:
@@ -47,7 +52,7 @@ class BarStore:
                 try:
                     with np.load(f) as z:
                         ts = z["ts"].astype("int64")
-                        val = z["ohlcv"].astype("float64")
+                        val = z["ohlcv"].astype("float32")     # float32 in memory: half the RAM
                     self._mem[symbol] = (ts, val)
                     return self._mem[symbol]
                 except Exception:
@@ -55,12 +60,69 @@ class BarStore:
         return None
 
     def _put(self, symbol: str, ts: np.ndarray, val: np.ndarray) -> None:
-        self._mem[symbol] = (ts, val)
+        self._mem[symbol] = (ts, np.asarray(val, dtype="float32"))
         if self.persist:
-            f = self._file(symbol)
-            tmp = f.with_name(f.stem + ".tmp.npz")
-            np.savez_compressed(tmp, ts=ts, ohlcv=val)
-            os.replace(tmp, f)
+            if self._batch:
+                self._dirty.add(symbol)
+            else:
+                self._write(symbol)
+
+    def _write(self, symbol: str) -> None:
+        ts, val = self._mem[symbol]
+        f = self._file(symbol)
+        tmp = f.with_name(f.stem + ".tmp.npz")
+        np.savez_compressed(tmp, ts=ts, ohlcv=val)
+        os.replace(tmp, f)
+
+    def flush(self) -> None:
+        """Write every symbol changed since the last flush."""
+        for sym in sorted(self._dirty):
+            if sym in self._mem:
+                self._write(sym)
+        self._dirty.clear()
+
+    @contextmanager
+    def batch(self):
+        """Group many appends (a long download) into fewer disk writes; flush() saves progress."""
+        self._batch += 1
+        try:
+            yield self
+        finally:
+            self._batch -= 1
+            if not self._batch:
+                self.flush()
+
+    # ---- small metadata file (how far back history has been fetched) -----
+    def _meta_file(self) -> Path:
+        return self.dir / "_meta.json"
+
+    def get_meta(self, key: str, default=None):
+        if self._meta is None:
+            self._meta = {}
+            if self.persist and self._meta_file().exists():
+                try:
+                    self._meta = json.loads(self._meta_file().read_text())
+                except Exception:
+                    self._meta = {}
+        return self._meta.get(key, default)
+
+    def set_meta(self, key: str, value) -> None:
+        self.get_meta(key)
+        self._meta[key] = value
+        if self.persist:
+            tmp = self._meta_file().with_suffix(".tmp")
+            tmp.write_text(json.dumps(self._meta))
+            os.replace(tmp, self._meta_file())
+
+    def session_days(self, symbols: Iterable[str]) -> np.ndarray:
+        """Sorted unique UTC dates (as int days since 1970) on which any of `symbols` has bars.
+        Regular-session bars (13:30-21:00 UTC) never cross UTC midnight, so this is the ET date."""
+        days = set()
+        for sym in symbols:
+            cur = self._get(sym)
+            if cur is not None and len(cur[0]):
+                days.update(np.unique(cur[0] // 86_400_000_000_000).tolist())
+        return np.array(sorted(days), dtype="int64")
 
     # ---- public ----------------------------------------------------------
     def symbols(self) -> List[str]:
@@ -87,14 +149,14 @@ class BarStore:
             cur = self._get(sym)
             if cur is not None and len(cur[0]):
                 ts = np.concatenate([cur[0], ts_new])
-                val = np.vstack([cur[1], val_new])
+                val = np.vstack([cur[1].astype("float64"), val_new])
             else:
                 ts, val = ts_new, val_new
             o = np.argsort(ts, kind="stable")
             ts, val = ts[o], val[o]
             keep = np.r_[ts[1:] != ts[:-1], True]  # last occurrence wins
             ts, val = ts[keep], val[keep]
-            if cur is None or len(ts) != len(cur[0]) or not np.array_equal(val, cur[1]):
+            if cur is None or len(ts) != len(cur[0]) or not np.array_equal(val.astype("float32"), cur[1]):
                 self._put(sym, ts, val)
             n += len(ts_new)
         return n
@@ -129,6 +191,7 @@ class BarStore:
 
     def drop(self, symbol: str) -> None:
         self._mem.pop(symbol, None)
+        self._dirty.discard(symbol)
         if self.persist:
             f = self._file(symbol)
             if f.exists():
@@ -177,5 +240,5 @@ class BarStore:
             }
         )
         for i, col in enumerate(_FIELDS):
-            df[col] = val[:, i]
+            df[col] = val[:, i].astype("float64")
         return df[BAR_COLUMNS]
